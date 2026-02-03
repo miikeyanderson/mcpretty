@@ -40,15 +40,35 @@ Three output modes are available:
 | `responsive` | Narrow terminals (<60 cols) | Colors but simplified layout, no right borders |
 | `plain` | Explicitly requested | ASCII-only, no ANSI codes |
 
+## Themes
+
+Two color themes are available:
+
+| Theme | Description |
+|-------|-------------|
+| `monokai-extended` | Monokai palette with semantic role coloring (default) |
+| `classic` | Original colors for backward compatibility |
+
+**Monokai Extended** applies colors based on semantic meaning:
+- Success/ok values → green
+- Error/fail values → red/pink
+- Warnings → yellow
+- Structural elements → muted gray
+- Primary keys → orange
+
 ## Controlling Output
 
-### Environment Variable
+### Environment Variables
 
 ```bash
 # Force a specific mode
 export MCP_RENDER_MODE=pretty      # Full styling
 export MCP_RENDER_MODE=responsive  # Compact styling
 export MCP_RENDER_MODE=plain       # No ANSI codes
+
+# Set color theme
+export MCP_THEME=monokai-extended  # Default
+export MCP_THEME=classic           # Original colors
 ```
 
 ### Command Line (Direct Usage)
@@ -57,6 +77,7 @@ export MCP_RENDER_MODE=plain       # No ANSI codes
 # Pipe JSON through renderer
 cat response.json | ~/.claude/bin/mcp-render
 ~/.claude/bin/mcp-render --mode plain response.json
+~/.claude/bin/mcp-render --theme classic response.json
 ~/.claude/bin/mcp-render --no-color response.json
 ```
 

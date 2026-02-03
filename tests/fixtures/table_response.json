@@ -1,0 +1,39 @@
+{
+  "version": "1.3",
+  "status": "success",
+  "metadata": {
+    "source": "codex",
+    "tool": "codex",
+    "question": "Analyze the test coverage"
+  },
+  "content": [
+    {
+      "type": "heading",
+      "level": 1,
+      "text": "Test Coverage Analysis"
+    },
+    {
+      "type": "table",
+      "headers": ["Module", "Coverage", "Status"],
+      "rows": [
+        ["auth.py", "94%", "Good"],
+        ["api.py", "67%", "Warning"],
+        ["utils.py", "23%", "Error"],
+        ["main.py", "88%", "Pass"]
+      ]
+    },
+    {
+      "type": "admonition",
+      "admonition_type": "warning",
+      "title": "Low Coverage",
+      "content": [
+        "utils.py has critically low test coverage.",
+        "Consider adding unit tests for the helper functions."
+      ]
+    },
+    {
+      "type": "paragraph",
+      "text": "Overall coverage is 68%, which is below the 80% target threshold."
+    }
+  ]
+}

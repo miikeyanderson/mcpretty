@@ -1,0 +1,21 @@
+{
+  "version": "1.3",
+  "status": "error",
+  "metadata": {
+    "source": "gemini",
+    "tool": "gemini_review_code",
+    "question": "Review this Swift code for concurrency issues"
+  },
+  "error": {
+    "code": "RATE_LIMIT_EXCEEDED",
+    "message": "API rate limit exceeded. Please retry after 60 seconds.",
+    "retry_after": 60
+  },
+  "content": [
+    {
+      "type": "error",
+      "code": "RATE_LIMIT_EXCEEDED",
+      "message": "API rate limit exceeded. Please retry after 60 seconds."
+    }
+  ]
+}

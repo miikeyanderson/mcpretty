@@ -5,6 +5,17 @@ MCP Response Renderer
 Renders structured JSON responses from Codex/Gemini MCP servers
 as beautiful ANSI-formatted terminal output.
 
+Architecture Decision (2026-02-03):
+    Single-file design chosen over package structure for:
+    - Hook simplicity: PostToolUse hook calls `python3 ~/.claude/bin/mcp-render` directly
+    - Zero install friction: Copy one file, done
+    - Self-contained: Role enum, palette, classifier all inline below
+
+    Future theming system will add:
+    - Role enum for semantic classification (struct.*, key.*, value.*, diff.*)
+    - Monokai Extended palette with truecolor/256/16 fallback
+    - Theme selection via --theme flag and MCP_THEME env var
+
 Usage:
     mcp-render < response.json
     mcp-render response.json
@@ -19,6 +30,47 @@ import re
 import argparse
 import shutil
 from typing import Any
+from enum import Enum
+
+
+# ============================================================================
+# Semantic Role Taxonomy (v1 Core)
+# ============================================================================
+# Roles classify output elements by semantic meaning, not JSON type.
+# This enables consistent, meaningful coloring across the entire response.
+#
+# Deferred to v1.1 (if needed):
+#   - value.id, value.enum, value.url, value.path, value.metric
+#   - key.secondary, key.noise
+#   - mcp.tool_name, mcp.resource, mcp.result, mcp.metadata
+# ============================================================================
+
+class Role(Enum):
+    """Semantic roles for terminal output elements."""
+
+    # Structural elements (box borders, tree connectors, punctuation)
+    STRUCT_FRAME = 'struct.frame'           # Box borders: ╭─╮│╰─╯
+    STRUCT_CONNECTOR = 'struct.connector'   # Tree lines: ├── └── │
+    STRUCT_PUNCTUATION = 'struct.punctuation'  # Brackets, colons, commas
+
+    # Key roles (JSON keys, labels, headers)
+    KEY_PRIMARY = 'key.primary'             # Important keys: status, result, error, tool
+    KEY_DEFAULT = 'key.default'             # Regular keys
+
+    # Value roles - status indicators
+    VALUE_STATUS_OK = 'value.status.ok'         # Success: ok, completed, true, pass, 2xx
+    VALUE_STATUS_ERROR = 'value.status.error'   # Error: error, failed, false, 4xx/5xx
+    VALUE_STATUS_WARNING = 'value.status.warning'  # Warning: warning, partial, pending
+
+    # Value roles - content
+    VALUE_TEXT = 'value.text'               # Default text content
+
+    # Diff roles
+    DIFF_ADDED = 'diff.added'               # Lines starting with +
+    DIFF_REMOVED = 'diff.removed'           # Lines starting with -
+    DIFF_HEADER = 'diff.header'             # @@ hunks, --- +++
+    DIFF_CONTEXT = 'diff.context'           # Unchanged context lines
+
 
 # Try to import wcwidth for proper Unicode width calculation
 try:
@@ -60,6 +112,362 @@ class Colors:
     BRIGHT_MAGENTA = "\033[95m"
     BRIGHT_CYAN = "\033[96m"
     BRIGHT_WHITE = "\033[97m"
+
+
+# ============================================================================
+# Theme Engine - Monokai Extended + Terminal Fallback
+# ============================================================================
+
+class TerminalCapability:
+    """Detect terminal color capabilities."""
+    TRUECOLOR = 'truecolor'  # 24-bit RGB
+    COLOR_256 = '256'        # xterm-256color
+    BASIC = 'basic'          # 16 colors
+
+    @staticmethod
+    def detect() -> str:
+        """Detect terminal color capability from environment."""
+        import os
+        colorterm = os.environ.get('COLORTERM', '').lower()
+        term = os.environ.get('TERM', '').lower()
+        term_program = os.environ.get('TERM_PROGRAM', '').lower()
+
+        # Truecolor detection - explicit env vars
+        if colorterm in ('truecolor', '24bit'):
+            return TerminalCapability.TRUECOLOR
+        if 'truecolor' in term or '24bit' in term:
+            return TerminalCapability.TRUECOLOR
+
+        # Truecolor detection - known modern terminals (may not set COLORTERM)
+        truecolor_terminals = ('kitty', 'wezterm', 'alacritty', 'iterm', 'hyper')
+        if any(t in term_program for t in truecolor_terminals):
+            return TerminalCapability.TRUECOLOR
+        if any(t in term for t in ('kitty', 'alacritty')):
+            return TerminalCapability.TRUECOLOR
+
+        # 256-color detection
+        if '256color' in term or '256' in colorterm:
+            return TerminalCapability.COLOR_256
+
+        # Default to basic
+        return TerminalCapability.BASIC
+
+
+def _truecolor(r: int, g: int, b: int) -> str:
+    """Generate truecolor (24-bit) ANSI foreground sequence."""
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+def _color256(code: int) -> str:
+    """Generate 256-color ANSI foreground sequence."""
+    return f"\033[38;5;{code}m"
+
+
+class MonokaiPalette:
+    """
+    Monokai Extended color palette with fallback tiers.
+
+    Canonical Monokai colors (verified via Perplexity 2026-02-03):
+    - Background: #272822 (not rendered, terminal handles this)
+    - Foreground: #F8F8F2 (off-white)
+    """
+
+    # Monokai hex values → RGB tuples
+    _HEX = {
+        'foreground':  (0xF8, 0xF8, 0xF2),  # #F8F8F2 off-white
+        'muted':       (0x75, 0x71, 0x5E),  # #75715E gray/comment
+        'green':       (0xA6, 0xE2, 0x2E),  # #A6E22E
+        'red':         (0xF9, 0x26, 0x72),  # #F92672 pink/red
+        'orange':      (0xFD, 0x97, 0x1F),  # #FD971F
+        'yellow':      (0xE6, 0xDB, 0x74),  # #E6DB74
+        'cyan':        (0x66, 0xD9, 0xEF),  # #66D9EF
+        'purple':      (0xAE, 0x81, 0xFF),  # #AE81FF
+    }
+
+    # 256-color approximations (closest xterm-256 codes)
+    _256 = {
+        'foreground': 255,  # White
+        'muted':      102,  # Grey
+        'green':      148,  # GreenYellow
+        'red':        197,  # DeepPink
+        'orange':     208,  # DarkOrange
+        'yellow':     186,  # LightGoldenrod
+        'cyan':       81,   # SteelBlue1
+        'purple':     141,  # MediumPurple
+    }
+
+    # Basic 16-color fallbacks
+    _BASIC = {
+        'foreground': Colors.BRIGHT_WHITE,
+        'muted':      Colors.BRIGHT_BLACK,
+        'green':      Colors.GREEN,
+        'red':        Colors.RED,
+        'orange':     Colors.YELLOW,  # No orange in basic, use yellow
+        'yellow':     Colors.YELLOW,
+        'cyan':       Colors.CYAN,
+        'purple':     Colors.MAGENTA,
+    }
+
+    @classmethod
+    def get(cls, name: str, capability: str = None) -> str:
+        """Get ANSI code for named color, respecting terminal capability."""
+        if capability is None:
+            capability = TerminalCapability.detect()
+
+        if capability == TerminalCapability.TRUECOLOR and name in cls._HEX:
+            r, g, b = cls._HEX[name]
+            return _truecolor(r, g, b)
+        elif capability == TerminalCapability.COLOR_256 and name in cls._256:
+            return _color256(cls._256[name])
+        else:
+            return cls._BASIC.get(name, Colors.WHITE)
+
+
+class Theme:
+    """Base theme class with Role → Color mapping."""
+
+    def get_color(self, role: Role, depth: int = 0) -> str:
+        """Get ANSI code for semantic role. Override in subclasses."""
+        return Colors.WHITE
+
+
+class MonokaiExtendedTheme(Theme):
+    """
+    Monokai Extended theme with semantic role mapping.
+
+    Color philosophy:
+    - Structural scaffolding: muted (de-emphasized)
+    - Primary keys/headings: orange (attention-grabbing)
+    - Success/ok: green
+    - Error/fail: red/pink
+    - Warning: yellow
+    - Default text: foreground (off-white)
+    - Diff: green/red/cyan for add/remove/header
+    """
+
+    # Role → Monokai color name mapping
+    _ROLE_MAP = {
+        # Structural - all muted
+        Role.STRUCT_FRAME: 'muted',
+        Role.STRUCT_CONNECTOR: 'muted',
+        Role.STRUCT_PUNCTUATION: 'muted',
+
+        # Keys
+        Role.KEY_PRIMARY: 'orange',
+        Role.KEY_DEFAULT: 'cyan',
+
+        # Status values
+        Role.VALUE_STATUS_OK: 'green',
+        Role.VALUE_STATUS_ERROR: 'red',
+        Role.VALUE_STATUS_WARNING: 'yellow',
+
+        # Content
+        Role.VALUE_TEXT: 'foreground',
+
+        # Diff
+        Role.DIFF_ADDED: 'green',
+        Role.DIFF_REMOVED: 'red',
+        Role.DIFF_HEADER: 'cyan',
+        Role.DIFF_CONTEXT: 'muted',
+    }
+
+    def __init__(self):
+        self._capability = TerminalCapability.detect()
+
+    # High-signal roles that should NOT be dimmed at depth
+    _NO_DIM_ROLES = {
+        Role.VALUE_STATUS_OK,
+        Role.VALUE_STATUS_ERROR,
+        Role.VALUE_STATUS_WARNING,
+        Role.KEY_PRIMARY,
+    }
+
+    def get_color(self, role: Role, depth: int = 0) -> str:
+        """Get ANSI code for semantic role with depth-based dimming."""
+        color_name = self._ROLE_MAP.get(role, 'foreground')
+        base_color = MonokaiPalette.get(color_name, self._capability)
+
+        # Depth modifier: add DIM for depth >= 2, but skip high-signal roles
+        if depth >= 2 and role not in self._NO_DIM_ROLES:
+            return Colors.DIM + base_color
+        return base_color
+
+
+class ClassicTheme(Theme):
+    """
+    Classic theme preserving original mcpretty behavior.
+
+    Maps roles back to the original hardcoded colors for backward compatibility.
+    """
+
+    _ROLE_MAP = {
+        Role.STRUCT_FRAME: Colors.DIM,
+        Role.STRUCT_CONNECTOR: Colors.DIM,
+        Role.STRUCT_PUNCTUATION: Colors.DIM,
+
+        Role.KEY_PRIMARY: Colors.BRIGHT_WHITE + Colors.BOLD,
+        Role.KEY_DEFAULT: Colors.WHITE,
+
+        Role.VALUE_STATUS_OK: Colors.GREEN,
+        Role.VALUE_STATUS_ERROR: Colors.RED,
+        Role.VALUE_STATUS_WARNING: Colors.YELLOW,
+
+        Role.VALUE_TEXT: Colors.WHITE,
+
+        Role.DIFF_ADDED: Colors.GREEN,
+        Role.DIFF_REMOVED: Colors.RED,
+        Role.DIFF_HEADER: Colors.CYAN,
+        Role.DIFF_CONTEXT: Colors.DIM,
+    }
+
+    def get_color(self, role: Role, depth: int = 0) -> str:
+        """Get ANSI code for semantic role (classic behavior)."""
+        return self._ROLE_MAP.get(role, Colors.WHITE)
+
+
+# Available themes
+THEMES = {
+    'monokai-extended': MonokaiExtendedTheme,
+    'classic': ClassicTheme,
+}
+
+# Active theme instance (set during init)
+ACTIVE_THEME: Theme = None
+
+
+def get_theme() -> Theme:
+    """Get active theme, initializing if needed."""
+    global ACTIVE_THEME
+    if ACTIVE_THEME is None:
+        ACTIVE_THEME = MonokaiExtendedTheme()
+    return ACTIVE_THEME
+
+
+def set_theme(name: str) -> None:
+    """Set active theme by name."""
+    global ACTIVE_THEME
+    theme_class = THEMES.get(name, MonokaiExtendedTheme)
+    ACTIVE_THEME = theme_class()
+
+
+def _cr(text: str, role: Role, depth: int = 0) -> str:
+    """Apply color to text based on semantic role (role-aware _c)."""
+    if not USE_COLOR:
+        return text
+    color = get_theme().get_color(role, depth)
+    return f"{color}{text}{Colors.RESET}"
+
+
+# ============================================================================
+# Semantic Classifier
+# ============================================================================
+# Classifies JSON keys and values into semantic roles.
+# Precedence: error > warning > success (most severe wins)
+# ============================================================================
+
+# Key patterns for classification
+_PRIMARY_KEYS = {'status', 'state', 'result', 'error', 'tool', 'type', 'code', 'message'}
+
+# Value patterns for status classification
+_ERROR_PATTERNS = re.compile(
+    r'\b(error|fail(ed|ure)?|exception|invalid|denied|forbidden|unauthorized|'
+    r'critical|fatal|abort(ed)?|crash(ed)?|broken|corrupt(ed)?|'
+    r'issue|bug|problem|danger)\b',
+    re.IGNORECASE
+)
+_WARNING_PATTERNS = re.compile(
+    r'\b(warn(ing)?|partial|pending|retry|timeout|slow|deprecated|'
+    r'skip(ped)?|missing|unknown|unstable)\b',
+    re.IGNORECASE
+)
+_SUCCESS_PATTERNS = re.compile(
+    r'\b(ok|success(ful)?|complete(d)?|done|pass(ed)?|valid|approved|'
+    r'ready|active|running|healthy|fixed|correct)\b',
+    re.IGNORECASE
+)
+
+# HTTP status code patterns - conservative matching to avoid false positives
+# Only match when explicitly prefixed with HTTP/status/code context
+_HTTP_ERROR_CODES = re.compile(
+    r'(?:HTTP(?:/[\d.]+)?\s+|status[:\s]*|code[:\s]*)[45]\d{2}\b',
+    re.IGNORECASE
+)
+_HTTP_SUCCESS_CODES = re.compile(
+    r'(?:HTTP(?:/[\d.]+)?\s+|status[:\s]*|code[:\s]*)[2]\d{2}\b',
+    re.IGNORECASE
+)
+
+
+def is_primary_key(key: str) -> bool:
+    """Check if key is a primary/important key."""
+    if not key:
+        return False
+    return key.lower() in _PRIMARY_KEYS
+
+
+def is_error_like(value: Any) -> bool:
+    """Check if value indicates an error state."""
+    if value is False:
+        return True
+    if isinstance(value, str):
+        if _ERROR_PATTERNS.search(value):
+            return True
+        if _HTTP_ERROR_CODES.search(value):
+            return True
+    return False
+
+
+def is_warning_like(value: Any) -> bool:
+    """Check if value indicates a warning state."""
+    if isinstance(value, str):
+        return bool(_WARNING_PATTERNS.search(value))
+    return False
+
+
+def is_success_like(value: Any) -> bool:
+    """Check if value indicates a success state."""
+    if value is True:
+        return True
+    if isinstance(value, str):
+        if _SUCCESS_PATTERNS.search(value):
+            return True
+        if _HTTP_SUCCESS_CODES.search(value):
+            return True
+    return False
+
+
+def classify_value(value: Any) -> Role:
+    """
+    Classify a value into a semantic role.
+
+    Precedence: error > warning > success > text
+    """
+    # Check in precedence order
+    if is_error_like(value):
+        return Role.VALUE_STATUS_ERROR
+    if is_warning_like(value):
+        return Role.VALUE_STATUS_WARNING
+    if is_success_like(value):
+        return Role.VALUE_STATUS_OK
+    return Role.VALUE_TEXT
+
+
+def classify_key(key: str) -> Role:
+    """Classify a key into a semantic role."""
+    if is_primary_key(key):
+        return Role.KEY_PRIMARY
+    return Role.KEY_DEFAULT
+
+
+def classify_diff_line(line: str) -> Role:
+    """Classify a diff line into a semantic role."""
+    if line.startswith('+') and not line.startswith('+++'):
+        return Role.DIFF_ADDED
+    if line.startswith('-') and not line.startswith('---'):
+        return Role.DIFF_REMOVED
+    if line.startswith('@@') or line.startswith('---') or line.startswith('+++'):
+        return Role.DIFF_HEADER
+    return Role.DIFF_CONTEXT
 
 
 # Box drawing characters
@@ -383,6 +791,14 @@ def _hyperlink(url: str, text: str) -> str:
 # Rendering Functions
 # ============================================================================
 
+def _colorize_cell(cell: str) -> str:
+    """Apply semantic role-based coloring to a table cell."""
+    role = classify_value(cell)
+    if role != Role.VALUE_TEXT:
+        return _cr(cell, role)
+    return cell
+
+
 def render_table(headers: list, rows: list) -> list:
     """Render a table with box-drawing characters."""
     if not headers:
@@ -409,14 +825,7 @@ def render_table(headers: list, rows: list) -> list:
             cells = []
             for i in range(len(headers)):
                 cell = str(row[i]) if i < len(row) else ''
-                cell_lower = cell.lower()
-                if 'error' in cell_lower or '🛑' in cell:
-                    cell = _c(cell, Colors.RED)
-                elif 'warning' in cell_lower or '⚠' in cell:
-                    cell = _c(cell, Colors.YELLOW)
-                elif any(x in cell_lower for x in ['good', 'pass', 'success', '✅']):
-                    cell = _c(cell, Colors.GREEN)
-                cells.append(cell)
+                cells.append(_colorize_cell(cell))
             lines.append('  '.join(cells))
         return lines
 
@@ -448,14 +857,7 @@ def render_table(headers: list, rows: list) -> list:
             cells = []
             for i in range(len(headers)):
                 cell = str(row[i]) if i < len(row) else ''
-                cell_lower = cell.lower()
-                if 'error' in cell_lower or '🛑' in cell:
-                    cell = _c(cell, Colors.RED)
-                elif 'warning' in cell_lower or '⚠' in cell:
-                    cell = _c(cell, Colors.YELLOW)
-                elif any(x in cell_lower for x in ['good', 'pass', 'success', '✅']):
-                    cell = _c(cell, Colors.GREEN)
-                cells.append(cell)
+                cells.append(_colorize_cell(cell))
             lines.append('  '.join(cells))
         return lines
 
@@ -474,9 +876,9 @@ def render_table(headers: list, rows: list) -> list:
 
     lines = []
 
-    # Top border
+    # Top border - use semantic role for structural frame
     top_parts = [BOX['h'] * w for w in col_widths]
-    lines.append(_c(BOX['tl'] + BOX['tj'].join(top_parts) + BOX['tr'], Colors.DIM))
+    lines.append(_cr(BOX['tl'] + BOX['tj'].join(top_parts) + BOX['tr'], Role.STRUCT_FRAME))
 
     # Header row
     header_cells = []
@@ -484,12 +886,13 @@ def render_table(headers: list, rows: list) -> list:
         padding = col_widths[i] - display_width(str(h))
         left_pad = padding // 2
         right_pad = padding - left_pad
-        header_cells.append(' ' * left_pad + _c(str(h), Colors.BRIGHT_WHITE, Colors.BOLD) + ' ' * right_pad)
-    lines.append(_c(BOX['v'], Colors.DIM) + _c(BOX['v'], Colors.DIM).join(header_cells) + _c(BOX['v'], Colors.DIM))
+        header_cells.append(' ' * left_pad + _cr(str(h), Role.KEY_PRIMARY) + ' ' * right_pad)
+    border = _cr(BOX['v'], Role.STRUCT_FRAME)
+    lines.append(border + border.join(header_cells) + border)
 
     # Header separator
     sep_parts = [BOX['dh'] * w for w in col_widths]
-    lines.append(_c(BOX['dlj'] + BOX['dx'].join(sep_parts) + BOX['drj'], Colors.DIM))
+    lines.append(_cr(BOX['dlj'] + BOX['dx'].join(sep_parts) + BOX['drj'], Role.STRUCT_FRAME))
 
     # Data rows
     for row in rows:
@@ -500,37 +903,54 @@ def render_table(headers: list, rows: list) -> list:
             max_cell_width = col_widths[i] - 2
             if display_width(cell) > max_cell_width:
                 cell = truncate_text(cell, max_cell_width)
-            # Color status cells
-            cell_lower = cell.lower()
-            if 'error' in cell_lower or '🛑' in cell:
-                cell = _c(cell, Colors.RED)
-            elif 'warning' in cell_lower or '⚠' in cell:
-                cell = _c(cell, Colors.YELLOW)
-            elif any(x in cell_lower for x in ['good', 'pass', 'success', '✅']):
-                cell = _c(cell, Colors.GREEN)
+            # Apply semantic coloring
+            cell = _colorize_cell(cell)
 
             padding = col_widths[i] - display_width(cell)
             cells.append(' ' + cell + ' ' * max(0, padding - 1))
-        lines.append(_c(BOX['v'], Colors.DIM) + _c(BOX['v'], Colors.DIM).join(cells) + _c(BOX['v'], Colors.DIM))
+        lines.append(border + border.join(cells) + border)
 
     # Bottom border
     bottom_parts = [BOX['h'] * w for w in col_widths]
-    lines.append(_c(BOX['bl'] + BOX['bj'].join(bottom_parts) + BOX['br'], Colors.DIM))
+    lines.append(_cr(BOX['bl'] + BOX['bj'].join(bottom_parts) + BOX['br'], Role.STRUCT_FRAME))
 
     return lines
 
 
+def _admonition_color(admon_type: str) -> str:
+    """Get color for admonition type, using semantic roles where applicable."""
+    # Semantic status types use theme-based roles
+    semantic_types = {
+        'warning': Role.VALUE_STATUS_WARNING,
+        'error': Role.VALUE_STATUS_ERROR,
+        'danger': Role.VALUE_STATUS_ERROR,
+        'success': Role.VALUE_STATUS_OK,
+        'tip': Role.VALUE_STATUS_OK,
+    }
+    if admon_type.lower() in semantic_types:
+        return get_theme().get_color(semantic_types[admon_type.lower()])
+
+    # Non-semantic types preserve original colors (backward compat)
+    original_colors = {
+        'info': Colors.BLUE,
+        'note': Colors.CYAN,
+        'important': Colors.MAGENTA,
+    }
+    return original_colors.get(admon_type.lower(), Colors.WHITE)
+
+
 def render_admonition(admon_type: str, title: str, content_lines: list) -> list:
-    """Render admonition/callout box."""
-    type_config = {
-        'warning': (Colors.YELLOW, ICONS['warning']),
-        'error': (Colors.RED, ICONS['error']),
-        'danger': (Colors.RED, ICONS['error']),
-        'info': (Colors.BLUE, ICONS['info']),
-        'tip': (Colors.GREEN, ICONS['tip']),
-        'note': (Colors.CYAN, ICONS['note']),
-        'success': (Colors.GREEN, ICONS['success']),
-        'important': (Colors.MAGENTA, ICONS['fire']),
+    """Render admonition/callout box with semantic role-based colors."""
+    # Icon mapping (independent of theme)
+    type_icons = {
+        'warning': ICONS['warning'],
+        'error': ICONS['error'],
+        'danger': ICONS['error'],
+        'info': ICONS['info'],
+        'tip': ICONS['tip'],
+        'note': ICONS['note'],
+        'success': ICONS['success'],
+        'important': ICONS['fire'],
     }
 
     # Plain mode icons (ASCII-safe)
@@ -539,7 +959,9 @@ def render_admonition(admon_type: str, title: str, content_lines: list) -> list:
         'tip': '[*]', 'note': '[>]', 'success': '[+]', 'important': '[!]',
     }
 
-    color, icon = type_config.get(admon_type.lower(), (Colors.WHITE, '●'))
+    # Get color (semantic roles for status types, original colors for info/note/etc)
+    color = _admonition_color(admon_type)
+    icon = type_icons.get(admon_type.lower(), '●')
 
     # Plain mode: simple text
     if RENDER_MODE == 'plain':
@@ -603,18 +1025,12 @@ def render_admonition(admon_type: str, title: str, content_lines: list) -> list:
 
 
 def render_diff(diff_lines: list) -> list:
-    """Render diff with colors."""
+    """Render diff with semantic role-based colors."""
     output = []
     for line in diff_lines:
         line = _sanitize(line)
-        if line.startswith('+') and not line.startswith('+++'):
-            output.append(_c(line, Colors.GREEN))
-        elif line.startswith('-') and not line.startswith('---'):
-            output.append(_c(line, Colors.RED))
-        elif line.startswith('@@'):
-            output.append(_c(line, Colors.CYAN))
-        else:
-            output.append(_c(line, Colors.DIM))
+        role = classify_diff_line(line)
+        output.append(_cr(line, role))
     return output
 
 
@@ -763,19 +1179,24 @@ def colorize_inline(text: str) -> str:
         result
     )
 
-    # Keywords
+    # Keywords - use semantic classifier
+    def color_keyword(match):
+        word = match.group(0)
+        role = classify_value(word)
+        if role != Role.VALUE_TEXT:
+            return _cr(word, role)
+        return word
+
     result = re.sub(
-        r'\b(Warning|Error|Issue|Bug|Problem|Critical|Danger|Fail|Failed)\b',
-        lambda m: _c(m.group(0), Colors.RED),
-        result, flags=re.IGNORECASE
+        r'\b(Warning|Error|Issue|Bug|Problem|Critical|Danger|Fail|Failed|Failure)\b',
+        color_keyword, result, flags=re.IGNORECASE
     )
     result = re.sub(
-        r'\b(Good|Great|Correct|Valid|Pass|Passed|Success|Approved|Ok|Fixed)\b',
-        lambda m: _c(m.group(0), Colors.GREEN),
-        result, flags=re.IGNORECASE
+        r'\b(Correct|Valid|Pass|Passed|Success|Approved|Ok|Fixed|Completed|Done)\b',
+        color_keyword, result, flags=re.IGNORECASE
     )
 
-    # Scores
+    # Scores - use semantic roles based on ratio
     def color_score(match):
         score_text = match.group(0)
         nums = re.findall(r'\d+', score_text)
@@ -784,11 +1205,11 @@ def colorize_inline(text: str) -> str:
             max_score = int(nums[1]) if len(nums) > 1 else 10
             ratio = score / max_score
             if ratio >= 0.7:
-                return _c(score_text, Colors.GREEN)
+                return _cr(score_text, Role.VALUE_STATUS_OK)
             elif ratio >= 0.4:
-                return _c(score_text, Colors.YELLOW)
+                return _cr(score_text, Role.VALUE_STATUS_WARNING)
             else:
-                return _c(score_text, Colors.RED)
+                return _cr(score_text, Role.VALUE_STATUS_ERROR)
         return score_text
 
     result = re.sub(r'\b(\d{1,2}/\d{1,2}|[Ss]core:?\s*\d+)\b', color_score, result)
@@ -982,7 +1403,17 @@ Examples:
     mcp-render --no-color response.json
     mcp-render --safe response.json
     mcp-render --mode=responsive response.json
+    mcp-render --theme=classic response.json
     MCP_RENDER_MODE=plain mcp-render response.json
+    MCP_THEME=classic mcp-render response.json
+
+Themes:
+    monokai-extended  Monokai Extended palette with semantic coloring (default)
+    classic           Original mcpretty colors for backward compatibility
+
+Environment Variables:
+    MCP_RENDER_MODE   Output mode: pretty, responsive, or plain
+    MCP_THEME         Color theme: monokai-extended or classic
         '''
     )
     parser.add_argument('file', nargs='?', help='JSON file to render (reads stdin if not provided)')
@@ -990,7 +1421,9 @@ Examples:
     parser.add_argument('--safe', action='store_true', help='Enable safe mode (strip ANSI, control chars)')
     parser.add_argument('--mode', choices=['pretty', 'responsive', 'plain'],
                         help='Output mode (default: auto-detect based on terminal width)')
-    parser.add_argument('--version', action='version', version='mcp-render 1.1.0')
+    parser.add_argument('--theme', choices=['monokai-extended', 'classic'],
+                        help='Color theme (default: monokai-extended)')
+    parser.add_argument('--version', action='version', version='mcp-render 1.2.0')
 
     args = parser.parse_args()
 
@@ -1005,6 +1438,11 @@ Examples:
 
     # Initialize terminal width (also sets RENDER_MODE from env)
     init_terminal_width()
+
+    # Set theme - precedence: --theme > MCP_THEME > default (monokai-extended)
+    import os
+    theme_name = args.theme or os.environ.get('MCP_THEME', 'monokai-extended')
+    set_theme(theme_name)
 
     # Read input
     try:

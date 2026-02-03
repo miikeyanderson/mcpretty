@@ -1,0 +1,47 @@
+{
+  "version": "1.3",
+  "status": "success",
+  "metadata": {
+    "source": "codex",
+    "tool": "codex",
+    "question": "Show me the proposed changes"
+  },
+  "content": [
+    {
+      "type": "heading",
+      "level": 1,
+      "text": "Proposed Changes"
+    },
+    {
+      "type": "paragraph",
+      "text": "Here's the diff for the color system refactor:"
+    },
+    {
+      "type": "diff",
+      "lines": [
+        "--- a/renderer.py",
+        "+++ b/renderer.py",
+        "@@ -35,10 +35,15 @@ class Colors:",
+        " class Colors:",
+        "-    RED = '\\033[31m'",
+        "-    GREEN = '\\033[32m'",
+        "+    # Monokai Extended palette",
+        "+    RED = '\\033[38;2;249;38;114m'",
+        "+    GREEN = '\\033[38;2;166;226;46m'",
+        "+    ORANGE = '\\033[38;2;253;151;31m'",
+        " ",
+        "     def apply(self, text, color):",
+        "         return f'{color}{text}{self.RESET}'"
+      ]
+    },
+    {
+      "type": "admonition",
+      "admonition_type": "info",
+      "title": "Note",
+      "content": [
+        "This change uses truecolor (24-bit) ANSI sequences.",
+        "Fallback for 256-color terminals will be added separately."
+      ]
+    }
+  ]
+}

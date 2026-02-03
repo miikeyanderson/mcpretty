@@ -12,7 +12,7 @@ Pretty terminal output for MCP tools. Transforms JSON responses from Codex and G
 
 - **Tree layout** — Visual hierarchy with `├──` `└──` `│` connectors
 - **Box drawing** — Tables and callouts with clean borders
-- **Syntax highlighting** — ANSI colors for code and emphasis
+- **Semantic coloring** — Monokai Extended palette with role-based colors
 - **Responsive** — Adapts to terminal width automatically
 
 ## Installation
@@ -70,6 +70,29 @@ cat response.json | ~/.claude/bin/mcp-render
 | `plain` | any | No ANSI |
 
 Set via environment: `export MCP_RENDER_MODE=plain`
+
+### Themes
+
+| Theme | Description |
+|-------|-------------|
+| `monokai-extended` | Monokai palette with semantic role coloring (default) |
+| `classic` | Original colors for backward compatibility |
+
+Set via CLI or environment:
+
+```bash
+~/.claude/bin/mcp-render --theme=classic response.json
+export MCP_THEME=monokai-extended
+```
+
+**Monokai Extended** uses semantic roles for consistent coloring:
+- Success/ok → green
+- Error/fail → red/pink
+- Warning → yellow
+- Structural elements → muted gray
+- Primary keys → orange
+
+**Terminal requirements:** For best results, use a terminal with truecolor (24-bit) support. Falls back to 256-color or basic 16-color automatically.
 
 ## How It Works
 
