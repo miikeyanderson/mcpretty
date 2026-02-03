@@ -1,0 +1,1058 @@
+#!/usr/bin/env python3
+"""
+MCP Response Renderer
+
+Renders structured JSON responses from Codex/Gemini MCP servers
+as beautiful ANSI-formatted terminal output.
+
+Usage:
+    mcp-render < response.json
+    mcp-render response.json
+    cat response.json | mcp-render
+    mcp-render --no-color response.json
+    mcp-render --safe response.json
+"""
+
+import sys
+import json
+import re
+import argparse
+import shutil
+from typing import Any
+
+# Try to import wcwidth for proper Unicode width calculation
+try:
+    from wcwidth import wcwidth as wc_char
+    HAS_WCWIDTH = True
+except ImportError:
+    HAS_WCWIDTH = False
+
+
+# ============================================================================
+# ANSI Color Codes & Styles
+# ============================================================================
+
+class Colors:
+    """ANSI color codes for terminal output."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+    UNDERLINE = "\033[4m"
+    STRIKETHROUGH = "\033[9m"
+
+    # Standard colors
+    BLACK = "\033[30m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+
+    # Bright colors
+    BRIGHT_BLACK = "\033[90m"
+    BRIGHT_RED = "\033[91m"
+    BRIGHT_GREEN = "\033[92m"
+    BRIGHT_YELLOW = "\033[93m"
+    BRIGHT_BLUE = "\033[94m"
+    BRIGHT_MAGENTA = "\033[95m"
+    BRIGHT_CYAN = "\033[96m"
+    BRIGHT_WHITE = "\033[97m"
+
+
+# Box drawing characters
+BOX = {
+    'tl': '╭', 'tr': '╮', 'bl': '╰', 'br': '╯',
+    'tl_sharp': '┌', 'tr_sharp': '┐', 'bl_sharp': '└', 'br_sharp': '┘',
+    'h': '─', 'v': '│',
+    'lj': '├', 'rj': '┤', 'tj': '┬', 'bj': '┴',
+    'x': '┼',
+    'dh': '═', 'dlj': '╞', 'drj': '╡', 'dx': '╪',
+}
+
+TREE = {
+    'branch': '├──',
+    'last': '└──',
+    'pipe': '│',
+}
+
+ICONS = {
+    'check': '✔', 'cross': '✘', 'box_empty': '☐', 'box_checked': '☑',
+    'warning': '⚠', 'error': '🛑', 'info': 'ℹ', 'tip': '💡', 'note': '📝',
+    'success': '✅', 'fire': '🔥', 'rocket': '🚀', 'star': '⭐',
+    'arrow_right': '→', 'bullet': '•',
+    'filled_block': '█', 'light_block': '░',
+}
+
+
+# ============================================================================
+# Globals for rendering mode
+# ============================================================================
+
+USE_COLOR = True
+SAFE_MODE = False
+TERM_WIDTH = 80  # Will be set from terminal or env
+CONTENT_WIDTH = 76  # TERM_WIDTH minus margins
+MIN_CONTENT_WIDTH = 20  # Minimum usable width (lowered for narrow terminals)
+
+# Output mode: 'pretty', 'responsive', or 'plain'
+# - pretty: Full boxes, line numbers, all styling (default for wide terminals)
+# - responsive: Colors but no right borders, simpler layout (auto for narrow)
+# - plain: ASCII-only, no ANSI codes
+RENDER_MODE = 'pretty'
+RESPONSIVE_THRESHOLD = 60  # Switch to responsive mode below this width
+
+# Layout constants for connector-only tree rendering
+# Principle: Connectors NEVER share a line with wrap-eligible text
+TREE_INDENT = 4          # Base indent for tree structure
+CONNECTOR_WIDTH = 4      # Width of connector column (e.g., "├── ")
+BODY_INDENT = 4          # Additional indent for wrapped body text
+
+
+def _c(text: str, *codes: str) -> str:
+    """Apply ANSI color codes to text."""
+    if not USE_COLOR:
+        return text
+    return f"{''.join(codes)}{text}{Colors.RESET}"
+
+
+# ANSI escape regex - handles:
+# - Standard CSI sequences (ESC [ ... final)
+# - Single-char controls (ESC @-Z, \, ^, _)
+# - OSC-8 hyperlinks with BEL terminator (ESC ]8;;url BEL text ESC ]8;; BEL)
+# - OSC-8 hyperlinks with ST terminator (ESC ]8;;url ESC \ text ESC ]8;; ESC \)
+ANSI_ESCAPE_RE = re.compile(
+    r'\x1B(?:'
+    r'[@-Z\\^_]|'                           # Single-char controls
+    r'\[[0-9;]*[ -/]*[@-~]|'                # CSI sequences
+    r'\]8;;[^\x07\x1B]*(?:\x07|\x1B\\)|'    # OSC-8 start (BEL or ST)
+    r'\]8;;\x07|'                           # OSC-8 end (BEL)
+    r'\]8;;\x1B\\'                          # OSC-8 end (ST)
+    r')'
+)
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from text."""
+    return ANSI_ESCAPE_RE.sub('', text)
+
+
+def _strip_ansi_len(text: str) -> int:
+    """Get display length excluding ANSI codes (legacy, use display_width)."""
+    return display_width(text)
+
+
+def display_width(text: str) -> int:
+    """
+    Get actual display width of text, accounting for:
+    - ANSI escape codes (ignored)
+    - Unicode character widths (wide chars = 2, zero-width = 0)
+    - Tabs expanded to 4 spaces
+    - Only measures first line if multiline
+    """
+    stripped = _strip_ansi(text)
+    # Handle multiline: measure first line only (caller should split)
+    if '\n' in stripped:
+        stripped = stripped.split('\n')[0]
+    # Expand tabs
+    stripped = stripped.replace('\t', '    ')
+    # Remove carriage returns
+    stripped = stripped.replace('\r', '')
+
+    if HAS_WCWIDTH:
+        # Per-char width, treating non-printable as 0
+        return sum(max(wc_char(ch), 0) for ch in stripped)
+    else:
+        # Fallback: assume ASCII width 1, common wide chars width 2
+        width = 0
+        for char in stripped:
+            cp = ord(char)
+            # CJK characters, box drawing, emoji ranges
+            if (0x1100 <= cp <= 0x115F or  # Hangul Jamo
+                0x2E80 <= cp <= 0x9FFF or  # CJK
+                0xAC00 <= cp <= 0xD7A3 or  # Hangul Syllables
+                0xF900 <= cp <= 0xFAFF or  # CJK Compatibility
+                0xFE10 <= cp <= 0xFE1F or  # Vertical forms
+                0x1F300 <= cp <= 0x1F9FF):  # Emoji
+                width += 2
+            elif cp < 32 or (0x7F <= cp <= 0x9F):  # Control chars
+                width += 0
+            else:
+                width += 1
+        return width
+
+
+def get_terminal_width() -> int:
+    """Get current terminal width, with sensible default."""
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
+
+
+def init_terminal_width():
+    """Initialize terminal width globals. Strictly honors terminal width."""
+    global TERM_WIDTH, CONTENT_WIDTH, RENDER_MODE, USE_COLOR
+    TERM_WIDTH = get_terminal_width()
+    # Strictly honor terminal width - content width is always term width minus margins
+    # Even on very narrow terminals, we respect the actual width
+    CONTENT_WIDTH = max(TERM_WIDTH - 4, MIN_CONTENT_WIDTH)
+    # But if terminal is narrower than MIN_CONTENT_WIDTH, use terminal width directly
+    if TERM_WIDTH < MIN_CONTENT_WIDTH + 4:
+        CONTENT_WIDTH = max(TERM_WIDTH - 2, 10)  # Minimal margin of 2
+
+    # Auto-detect render mode from env or terminal width
+    import os
+    env_mode = os.environ.get('MCP_RENDER_MODE', '').lower()
+    if env_mode in ('pretty', 'responsive', 'plain'):
+        RENDER_MODE = env_mode
+    elif TERM_WIDTH < RESPONSIVE_THRESHOLD:
+        RENDER_MODE = 'responsive'
+    else:
+        RENDER_MODE = 'pretty'
+
+    # Plain mode disables colors
+    if RENDER_MODE == 'plain':
+        USE_COLOR = False
+
+
+def wrap_text(text: str, width: int, indent: str = '') -> list:
+    """
+    Wrap text to fit within width, preserving ANSI codes.
+    Returns list of lines.
+    """
+    if width <= 0:
+        width = CONTENT_WIDTH
+
+    stripped = _strip_ansi(text)
+    if display_width(stripped) <= width:
+        return [text]
+
+    # Simple word-wrap on the stripped text, then we lose styling on wrapped portions
+    # This is a tradeoff for simplicity - wrapped lines get no styling
+    words = stripped.split(' ')
+    lines = []
+    current_line = indent
+    current_width = display_width(indent)
+
+    for word in words:
+        word_width = display_width(word)
+        if current_width + word_width + 1 <= width:
+            if current_line != indent:
+                current_line += ' '
+                current_width += 1
+            current_line += word
+            current_width += word_width
+        else:
+            if current_line != indent:
+                lines.append(current_line)
+            current_line = indent + word
+            current_width = display_width(indent) + word_width
+
+    if current_line != indent:
+        lines.append(current_line)
+
+    # First line gets original styling
+    if lines and text != stripped:
+        lines[0] = text[:len(text) - len(stripped)] + lines[0][len(indent):]
+
+    return lines if lines else [text]
+
+
+def truncate_text(text: str, width: int, suffix: str = '...') -> str:
+    """Truncate text to fit within width, adding suffix if truncated."""
+    if display_width(text) <= width:
+        return text
+
+    stripped = _strip_ansi(text)
+    suffix_width = display_width(suffix)
+    target_width = width - suffix_width
+
+    # Truncate character by character
+    result = ''
+    current_width = 0
+    for char in stripped:
+        char_width = display_width(char)
+        if current_width + char_width > target_width:
+            break
+        result += char
+        current_width += char_width
+
+    return result + suffix
+
+
+# ============================================================================
+# Connector-Only Tree Layout Helpers
+# Principle: Connectors NEVER share a line with wrap-eligible text
+# ============================================================================
+
+def tree_connector_line(depth: int = 0, is_last: bool = False, show_branch: bool = True) -> str:
+    """
+    Generate a connector-only line (no text content).
+
+    Example outputs:
+        depth=0: "    |" or "    ├──" or "    └──"
+        depth=1: "    │   |" etc.
+    """
+    base_indent = ' ' * TREE_INDENT
+
+    if RENDER_MODE == 'plain':
+        if show_branch:
+            branch = '+--' if not is_last else '\\--'
+        else:
+            branch = '|'
+        return f"{base_indent}{branch}"
+
+    # Pretty/responsive mode with Unicode
+    if show_branch:
+        branch = TREE['last'] if is_last else TREE['branch']
+    else:
+        branch = TREE['pipe']
+
+    return f"{base_indent}{_c(branch, Colors.DIM)}"
+
+
+def tree_title_line(title: str, depth: int = 0) -> str:
+    """
+    Generate a title line (indented, no connector).
+    Title appears on its own line after a connector line.
+    """
+    indent = ' ' * (TREE_INDENT + CONNECTOR_WIDTH)
+    return f"{indent}{title}"
+
+
+def tree_body_lines(text: str, depth: int = 0, max_width: int = None) -> list:
+    """
+    Generate wrapped body lines (indented, no connectors).
+    Body text appears on separate lines, allowing natural wrapping.
+
+    Returns list of lines, each properly indented.
+    """
+    if max_width is None:
+        max_width = CONTENT_WIDTH - TREE_INDENT - CONNECTOR_WIDTH - BODY_INDENT
+
+    indent = ' ' * (TREE_INDENT + CONNECTOR_WIDTH)
+
+    # For plain mode or short text, just return indented
+    stripped = _strip_ansi(text)
+    if RENDER_MODE == 'plain' or display_width(stripped) <= max_width:
+        return [f"{indent}{text}"]
+
+    # Wrap the text
+    wrapped = wrap_text(stripped, max_width, '')
+
+    # First line gets original styling if present
+    result = []
+    for i, line in enumerate(wrapped):
+        if i == 0 and text != stripped:
+            # Try to preserve some styling on first line
+            result.append(f"{indent}{colorize_inline(line)}")
+        else:
+            result.append(f"{indent}{colorize_inline(line)}")
+
+    return result
+
+
+def _sanitize(text: str) -> str:
+    """Sanitize text for safe terminal output."""
+    if not SAFE_MODE:
+        return text
+    # Remove ANSI escape sequences (use same regex as _strip_ansi)
+    text = ANSI_ESCAPE_RE.sub('', text)
+    # Remove control characters except newline/tab
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+    return text
+
+
+def _hyperlink(url: str, text: str) -> str:
+    """Create clickable terminal hyperlink (OSC 8)."""
+    if SAFE_MODE or not USE_COLOR:
+        return f"{text} ({url})"
+    # Validate URL scheme
+    if not re.match(r'^https?://', url):
+        return text
+    # Reject URLs with control characters or escape sequences (security)
+    if re.search(r'[\x00-\x1F\x7F]', url):
+        return text
+    return f"\033]8;;{url}\033\\{_c(text, Colors.BLUE, Colors.UNDERLINE)}\033]8;;\033\\"
+
+
+# ============================================================================
+# Rendering Functions
+# ============================================================================
+
+def render_table(headers: list, rows: list) -> list:
+    """Render a table with box-drawing characters."""
+    if not headers:
+        return []
+
+    # Plain mode: simple text table
+    if RENDER_MODE == 'plain':
+        lines = []
+        lines.append(' | '.join(str(h) for h in headers))
+        lines.append('-' * display_width(lines[0]))
+        for row in rows:
+            lines.append(' | '.join(str(row[i]) if i < len(row) else '' for i in range(len(headers))))
+        return lines
+
+    # Responsive mode: minimal borders, left-aligned
+    if RENDER_MODE == 'responsive':
+        lines = []
+        # Header
+        header_text = '  '.join(_c(str(h), Colors.BRIGHT_WHITE, Colors.BOLD) for h in headers)
+        lines.append(header_text)
+        lines.append(_c('─' * min(display_width(_strip_ansi(header_text)), CONTENT_WIDTH - 8), Colors.DIM))
+        # Rows
+        for row in rows:
+            cells = []
+            for i in range(len(headers)):
+                cell = str(row[i]) if i < len(row) else ''
+                cell_lower = cell.lower()
+                if 'error' in cell_lower or '🛑' in cell:
+                    cell = _c(cell, Colors.RED)
+                elif 'warning' in cell_lower or '⚠' in cell:
+                    cell = _c(cell, Colors.YELLOW)
+                elif any(x in cell_lower for x in ['good', 'pass', 'success', '✅']):
+                    cell = _c(cell, Colors.GREEN)
+                cells.append(cell)
+            lines.append('  '.join(cells))
+        return lines
+
+    # Pretty mode: full box-drawing table
+    # Calculate natural column widths
+    col_widths = []
+    for i in range(len(headers)):
+        max_width = display_width(str(headers[i]))
+        for row in rows:
+            if i < len(row):
+                max_width = max(max_width, display_width(str(row[i])))
+        col_widths.append(max_width + 2)
+
+    # Cap total width to terminal width (account for borders: n+1 border chars)
+    border_overhead = len(col_widths) + 1
+    max_table_width = CONTENT_WIDTH - 8  # Leave margin for tree prefix
+    available_for_cols = max_table_width - border_overhead
+    min_col_width = 4
+
+    # Check if table can fit at all with minimum widths
+    min_total = min_col_width * len(col_widths)
+    if available_for_cols < min_total:
+        # Can't fit in pretty mode - fall back to responsive rendering
+        lines = []
+        header_text = '  '.join(_c(str(h), Colors.BRIGHT_WHITE, Colors.BOLD) for h in headers)
+        lines.append(header_text)
+        lines.append(_c('─' * min(display_width(_strip_ansi(header_text)), CONTENT_WIDTH - 8), Colors.DIM))
+        for row in rows:
+            cells = []
+            for i in range(len(headers)):
+                cell = str(row[i]) if i < len(row) else ''
+                cell_lower = cell.lower()
+                if 'error' in cell_lower or '🛑' in cell:
+                    cell = _c(cell, Colors.RED)
+                elif 'warning' in cell_lower or '⚠' in cell:
+                    cell = _c(cell, Colors.YELLOW)
+                elif any(x in cell_lower for x in ['good', 'pass', 'success', '✅']):
+                    cell = _c(cell, Colors.GREEN)
+                cells.append(cell)
+            lines.append('  '.join(cells))
+        return lines
+
+    if sum(col_widths) > available_for_cols:
+        # Proportionally shrink columns
+        total_content = sum(col_widths)
+        scale = available_for_cols / total_content
+        col_widths = [max(min_col_width, int(w * scale)) for w in col_widths]
+
+        # Second pass: if still over budget due to min widths, force-shrink largest
+        while sum(col_widths) > available_for_cols:
+            max_idx = col_widths.index(max(col_widths))
+            if col_widths[max_idx] <= min_col_width:
+                break  # Can't shrink further (shouldn't happen due to check above)
+            col_widths[max_idx] -= 1
+
+    lines = []
+
+    # Top border
+    top_parts = [BOX['h'] * w for w in col_widths]
+    lines.append(_c(BOX['tl'] + BOX['tj'].join(top_parts) + BOX['tr'], Colors.DIM))
+
+    # Header row
+    header_cells = []
+    for i, h in enumerate(headers):
+        padding = col_widths[i] - display_width(str(h))
+        left_pad = padding // 2
+        right_pad = padding - left_pad
+        header_cells.append(' ' * left_pad + _c(str(h), Colors.BRIGHT_WHITE, Colors.BOLD) + ' ' * right_pad)
+    lines.append(_c(BOX['v'], Colors.DIM) + _c(BOX['v'], Colors.DIM).join(header_cells) + _c(BOX['v'], Colors.DIM))
+
+    # Header separator
+    sep_parts = [BOX['dh'] * w for w in col_widths]
+    lines.append(_c(BOX['dlj'] + BOX['dx'].join(sep_parts) + BOX['drj'], Colors.DIM))
+
+    # Data rows
+    for row in rows:
+        cells = []
+        for i in range(len(headers)):
+            cell = str(row[i]) if i < len(row) else ''
+            # Truncate if too long for column
+            max_cell_width = col_widths[i] - 2
+            if display_width(cell) > max_cell_width:
+                cell = truncate_text(cell, max_cell_width)
+            # Color status cells
+            cell_lower = cell.lower()
+            if 'error' in cell_lower or '🛑' in cell:
+                cell = _c(cell, Colors.RED)
+            elif 'warning' in cell_lower or '⚠' in cell:
+                cell = _c(cell, Colors.YELLOW)
+            elif any(x in cell_lower for x in ['good', 'pass', 'success', '✅']):
+                cell = _c(cell, Colors.GREEN)
+
+            padding = col_widths[i] - display_width(cell)
+            cells.append(' ' + cell + ' ' * max(0, padding - 1))
+        lines.append(_c(BOX['v'], Colors.DIM) + _c(BOX['v'], Colors.DIM).join(cells) + _c(BOX['v'], Colors.DIM))
+
+    # Bottom border
+    bottom_parts = [BOX['h'] * w for w in col_widths]
+    lines.append(_c(BOX['bl'] + BOX['bj'].join(bottom_parts) + BOX['br'], Colors.DIM))
+
+    return lines
+
+
+def render_admonition(admon_type: str, title: str, content_lines: list) -> list:
+    """Render admonition/callout box."""
+    type_config = {
+        'warning': (Colors.YELLOW, ICONS['warning']),
+        'error': (Colors.RED, ICONS['error']),
+        'danger': (Colors.RED, ICONS['error']),
+        'info': (Colors.BLUE, ICONS['info']),
+        'tip': (Colors.GREEN, ICONS['tip']),
+        'note': (Colors.CYAN, ICONS['note']),
+        'success': (Colors.GREEN, ICONS['success']),
+        'important': (Colors.MAGENTA, ICONS['fire']),
+    }
+
+    # Plain mode icons (ASCII-safe)
+    plain_icons = {
+        'warning': '[!]', 'error': '[X]', 'danger': '[X]', 'info': '[i]',
+        'tip': '[*]', 'note': '[>]', 'success': '[+]', 'important': '[!]',
+    }
+
+    color, icon = type_config.get(admon_type.lower(), (Colors.WHITE, '●'))
+
+    # Plain mode: simple text
+    if RENDER_MODE == 'plain':
+        plain_icon = plain_icons.get(admon_type.lower(), '[>]')
+        output = [f"{plain_icon} {admon_type.upper()}: {title or ''}"]
+        if content_lines:
+            for line in content_lines:
+                output.append(f"    {_sanitize(line)}")
+        return output
+
+    header = f"{icon} {_c(admon_type.upper(), color, Colors.BOLD)}: {_c(title or '', Colors.BRIGHT_WHITE)}"
+
+    lines = [header]
+    if content_lines:
+        lines.append('')
+        lines.extend(_sanitize(line) for line in content_lines)
+
+    if not lines:
+        return []
+
+    # Responsive mode: left border only, no right padding
+    if RENDER_MODE == 'responsive':
+        output = []
+        output.append(f"{_c(icon, color)} {_c(admon_type.upper(), color, Colors.BOLD)}: {_c(title or '', Colors.BRIGHT_WHITE)}")
+        for line in content_lines:
+            output.append(f"  {_c('│', color)} {_sanitize(line)}")
+        return output
+
+    # Pretty mode: full box
+    # Calculate width, capped to terminal
+    max_content_width = max(display_width(line) for line in lines)
+    max_box_width = CONTENT_WIDTH - 12  # Leave margin for tree prefix
+
+    # If terminal too narrow for pretty mode box, fall back to responsive
+    if max_box_width < 20:
+        output = []
+        output.append(f"{_c(icon, color)} {_c(admon_type.upper(), color, Colors.BOLD)}: {_c(title or '', Colors.BRIGHT_WHITE)}")
+        for line in content_lines:
+            output.append(f"  {_c('│', color)} {_sanitize(line)}")
+        return output
+
+    inner_width = min(max_content_width, max_box_width - 4)
+    width = inner_width + 4
+
+    # Wrap/truncate lines that are too long
+    wrapped_lines = []
+    for line in lines:
+        if display_width(line) > inner_width:
+            wrapped_lines.append(truncate_text(line, inner_width))
+        else:
+            wrapped_lines.append(line)
+
+    output = []
+    output.append(f"{_c(BOX['tl'], color)}{_c(BOX['h'] * (width - 2), color)}{_c(BOX['tr'], color)}")
+    for line in wrapped_lines:
+        padding = max(0, width - display_width(line) - 4)
+        output.append(f"{_c(BOX['v'], color)} {line}{' ' * padding} {_c(BOX['v'], color)}")
+    output.append(f"{_c(BOX['bl'], color)}{_c(BOX['h'] * (width - 2), color)}{_c(BOX['br'], color)}")
+
+    return output
+
+
+def render_diff(diff_lines: list) -> list:
+    """Render diff with colors."""
+    output = []
+    for line in diff_lines:
+        line = _sanitize(line)
+        if line.startswith('+') and not line.startswith('+++'):
+            output.append(_c(line, Colors.GREEN))
+        elif line.startswith('-') and not line.startswith('---'):
+            output.append(_c(line, Colors.RED))
+        elif line.startswith('@@'):
+            output.append(_c(line, Colors.CYAN))
+        else:
+            output.append(_c(line, Colors.DIM))
+    return output
+
+
+def syntax_highlight(code: str, language: str) -> str:
+    """Apply basic syntax highlighting."""
+    lang = language.lower()
+    if lang not in ['python', 'py', 'swift', 'rust', 'javascript', 'js', 'typescript', 'ts', 'go', 'java']:
+        return code
+
+    result = code
+
+    # Comments
+    result = re.sub(r'(#.*?)$', lambda m: _c(m.group(1), Colors.BRIGHT_BLACK), result, flags=re.MULTILINE)
+    result = re.sub(r'(//.*?)$', lambda m: _c(m.group(1), Colors.BRIGHT_BLACK), result, flags=re.MULTILINE)
+
+    # Strings
+    result = re.sub(r'(".*?"|\'.*?\')', lambda m: _c(m.group(1), Colors.GREEN), result)
+
+    # Numbers
+    result = re.sub(r'\b(\d+\.?\d*)\b', lambda m: _c(m.group(1), Colors.BRIGHT_MAGENTA), result)
+
+    # Keywords
+    if lang in ['python', 'py']:
+        keywords = ['def', 'class', 'if', 'else', 'elif', 'for', 'while', 'return', 'import', 'from',
+                    'as', 'try', 'except', 'with', 'lambda', 'yield', 'True', 'False', 'None',
+                    'and', 'or', 'not', 'in', 'is', 'async', 'await', 'raise', 'pass', 'break', 'continue']
+    elif lang == 'swift':
+        keywords = ['func', 'class', 'struct', 'enum', 'protocol', 'extension', 'if', 'else', 'guard',
+                    'for', 'while', 'return', 'import', 'let', 'var', 'true', 'false', 'nil',
+                    'async', 'await', 'throws', 'try', 'catch', 'self', 'Self', 'some', 'any', '@MainActor']
+    else:
+        keywords = ['function', 'const', 'let', 'var', 'if', 'else', 'for', 'while', 'return',
+                    'import', 'export', 'class', 'async', 'await', 'true', 'false', 'null', 'undefined']
+
+    for kw in keywords:
+        result = re.sub(rf'\b({kw})\b', lambda m, k=kw: _c(m.group(1), Colors.MAGENTA, Colors.BOLD), result)
+
+    # Decorators
+    result = re.sub(r'(@\w+)', lambda m: _c(m.group(1), Colors.YELLOW), result)
+
+    return result
+
+
+def render_code_block(code: str, language: str, filename: str = None, line_start: int = 1) -> list:
+    """Render code block with syntax highlighting and border."""
+    sanitized = _sanitize(code)
+    code_lines = sanitized.split('\n')
+
+    # Plain mode: simple indented output
+    if RENDER_MODE == 'plain':
+        output = [f"[{language}]" + (f" {filename}" if filename else "")]
+        for i, line in enumerate(code_lines, line_start):
+            output.append(f"  {i:3}| {line}")
+        return output
+
+    # Apply syntax highlighting for pretty/responsive
+    highlighted = syntax_highlight(sanitized, language)
+    code_lines = highlighted.split('\n')
+
+    # Responsive mode: left-anchored, no right border
+    if RENDER_MODE == 'responsive':
+        output = []
+        lang_label = _c(f"── {language} ", Colors.DIM) + (f"({filename})" if filename else "")
+        output.append(lang_label)
+        for i, line in enumerate(code_lines, line_start):
+            line_num = _c(f'{i:3}', Colors.BRIGHT_BLACK)
+            output.append(f"  {line_num} {line}")
+        return output
+
+    # Pretty mode: full box with borders
+    max_code_width = max(display_width(line) for line in code_lines) if code_lines else 20
+    natural_width = max(max_code_width + 8, display_width(language) + 10)
+    max_block_width = CONTENT_WIDTH - 12  # Leave margin for tree prefix
+
+    # If terminal too narrow for pretty mode box (min ~20 chars), fall back to responsive
+    if max_block_width < 20:
+        output = []
+        lang_label = _c(f"── {language} ", Colors.DIM) + (f"({filename})" if filename else "")
+        output.append(lang_label)
+        for i, line in enumerate(code_lines, line_start):
+            line_num = _c(f'{i:3}', Colors.BRIGHT_BLACK)
+            output.append(f"  {line_num} {line}")
+        return output
+
+    width = min(natural_width, max_block_width)
+
+    # Max displayable code width (accounting for line numbers and borders)
+    max_line_width = width - 8  # border + line num + padding
+
+    output = []
+
+    # Top border with language
+    lang_label = f" {language} "
+    if filename:
+        lang_label = f" {language} - {filename} "
+    # Truncate label if too long
+    if display_width(lang_label) > width - 4:
+        lang_label = truncate_text(lang_label, width - 6) + " "
+    remaining = max(0, width - display_width(lang_label) - 2)
+    output.append(f"{_c(BOX['tl_sharp'] + BOX['h'], Colors.DIM)}{_c(lang_label, Colors.BRIGHT_BLACK)}{_c(BOX['h'] * remaining + BOX['tr_sharp'], Colors.DIM)}")
+
+    # Code lines with line numbers
+    for i, line in enumerate(code_lines, line_start):
+        line_num = _c(f'{i:3}', Colors.BRIGHT_BLACK)
+        # Truncate long lines
+        line_stripped = _strip_ansi(line)
+        if display_width(line_stripped) > max_line_width:
+            line = truncate_text(line_stripped, max_line_width)
+        padding = max(0, width - display_width(line) - 6)
+        output.append(f"{_c(BOX['v'], Colors.DIM)} {line_num} {line}{' ' * padding}{_c(BOX['v'], Colors.DIM)}")
+
+    # Bottom border
+    output.append(f"{_c(BOX['bl_sharp'] + BOX['h'] * (width - 1) + BOX['br_sharp'], Colors.DIM)}")
+
+    return output
+
+
+def colorize_inline(text: str) -> str:
+    """Apply colors to inline markdown elements."""
+    text = _sanitize(text)
+    result = text
+
+    # Links [text](url)
+    result = re.sub(
+        r'\[([^\]]+)\]\(([^)]+)\)',
+        lambda m: _hyperlink(m.group(2), m.group(1)),
+        result
+    )
+
+    # Inline code
+    result = re.sub(r'`([^`]+)`', lambda m: _c(m.group(1), Colors.BRIGHT_CYAN), result)
+
+    # Bold
+    result = re.sub(r'\*\*(.+?)\*\*', lambda m: _c(m.group(1), Colors.BOLD), result)
+
+    # Italic
+    result = re.sub(r'(?<!\*)\*([^*]+)\*(?!\*)', lambda m: _c(m.group(1), Colors.ITALIC), result)
+
+    # Strikethrough
+    result = re.sub(r'~~(.+?)~~', lambda m: _c(m.group(1), Colors.STRIKETHROUGH), result)
+
+    # File paths
+    result = re.sub(
+        r'(?<![a-zA-Z0-9_])([a-zA-Z0-9_./\\-]+\.[a-zA-Z]{1,5})(:\d+)?(?![a-zA-Z0-9_])',
+        lambda m: _c(m.group(0), Colors.CYAN),
+        result
+    )
+
+    # Keywords
+    result = re.sub(
+        r'\b(Warning|Error|Issue|Bug|Problem|Critical|Danger|Fail|Failed)\b',
+        lambda m: _c(m.group(0), Colors.RED),
+        result, flags=re.IGNORECASE
+    )
+    result = re.sub(
+        r'\b(Good|Great|Correct|Valid|Pass|Passed|Success|Approved|Ok|Fixed)\b',
+        lambda m: _c(m.group(0), Colors.GREEN),
+        result, flags=re.IGNORECASE
+    )
+
+    # Scores
+    def color_score(match):
+        score_text = match.group(0)
+        nums = re.findall(r'\d+', score_text)
+        if nums:
+            score = int(nums[0])
+            max_score = int(nums[1]) if len(nums) > 1 else 10
+            ratio = score / max_score
+            if ratio >= 0.7:
+                return _c(score_text, Colors.GREEN)
+            elif ratio >= 0.4:
+                return _c(score_text, Colors.YELLOW)
+            else:
+                return _c(score_text, Colors.RED)
+        return score_text
+
+    result = re.sub(r'\b(\d{1,2}/\d{1,2}|[Ss]core:?\s*\d+)\b', color_score, result)
+
+    return result
+
+
+# ============================================================================
+# Main Renderer
+# ============================================================================
+
+def render_block(block: dict, is_last: bool = False) -> list:
+    """Render a single content block."""
+    connector = TREE['last'] if is_last else TREE['branch']
+    block_type = block.get('type', 'paragraph')
+    lines = []
+
+    if block_type == 'heading':
+        # Connector-only pattern: connector line, then title on separate line
+        level = block.get('level', 1)
+        text = _sanitize(block.get('text', ''))
+        prefix = "▸ " if level <= 2 else "  "
+        formatted = _c(f"{prefix}{text}", Colors.BRIGHT_WHITE, Colors.BOLD)
+        lines.append(tree_connector_line(is_last=is_last))
+        lines.append(tree_title_line(formatted))
+
+    elif block_type == 'paragraph':
+        # Connector-only pattern: connector line separate from text
+        text = colorize_inline(block.get('text', ''))
+        lines.append(tree_connector_line(is_last=is_last))
+        lines.extend(tree_body_lines(text))
+
+    elif block_type == 'list':
+        # Connector-only pattern: connector + bullet on one line, text wraps below
+        items = block.get('items', [])
+        ordered = block.get('ordered', False)
+        for j, item in enumerate(items):
+            is_last_item = is_last and j == len(items) - 1
+            bullet = f"{j+1}." if ordered else _c(ICONS['bullet'], Colors.YELLOW)
+            item_text = colorize_inline(item)
+            # Connector line with bullet marker
+            lines.append(tree_connector_line(is_last=is_last_item) + f" {bullet}")
+            # Wrapped item text on separate lines
+            lines.extend(tree_body_lines(item_text))
+
+    elif block_type == 'task_list':
+        # Connector-only pattern: connector + checkbox on one line, text wraps below
+        tasks = block.get('tasks', [])
+        for j, task in enumerate(tasks):
+            is_last_task = is_last and j == len(tasks) - 1
+            done = task.get('done', False)
+            text = _sanitize(task.get('text', ''))
+            if done:
+                icon = _c(ICONS['check'], Colors.GREEN)
+                text_formatted = _c(text, Colors.DIM)
+            else:
+                icon = _c(ICONS['box_empty'], Colors.BRIGHT_BLACK)
+                text_formatted = colorize_inline(text)
+            # Connector line with checkbox
+            lines.append(tree_connector_line(is_last=is_last_task) + f" {icon}")
+            # Wrapped task text on separate lines
+            lines.extend(tree_body_lines(text_formatted))
+
+    elif block_type == 'code_block':
+        language = block.get('language', 'text')
+        code = block.get('code', '')
+        filename = block.get('filename')
+        line_start = block.get('line_start', 1)
+        code_lines = render_code_block(code, language, filename, line_start)
+        for code_line in code_lines:
+            lines.append(f"    {_c(TREE['pipe'], Colors.DIM)}   {code_line}")
+
+    elif block_type == 'table':
+        headers = block.get('headers', [])
+        rows = block.get('rows', [])
+        table_lines = render_table(headers, rows)
+        for table_line in table_lines:
+            lines.append(f"    {_c(TREE['pipe'], Colors.DIM)}   {table_line}")
+
+    elif block_type == 'admonition':
+        admon_type = block.get('admonition_type', 'note')
+        title = block.get('title', '')
+        content = block.get('content', [])
+        admon_lines = render_admonition(admon_type, title, content)
+        for admon_line in admon_lines:
+            lines.append(f"    {_c(TREE['pipe'], Colors.DIM)}   {admon_line}")
+
+    elif block_type == 'diff':
+        diff_lines = block.get('lines', [])
+        formatted_diff = render_diff(diff_lines)
+        for diff_line in formatted_diff:
+            lines.append(f"    {_c(TREE['pipe'], Colors.DIM)}   {diff_line}")
+
+    elif block_type == 'blockquote':
+        # Connector-only pattern: connector line, then quoted text with quote marker
+        text = _sanitize(block.get('text', ''))
+        lines.append(tree_connector_line(is_last=is_last))
+        indent = ' ' * (TREE_INDENT + CONNECTOR_WIDTH)
+        for quote_line in text.split('\n'):
+            lines.append(f"{indent}{_c('│', Colors.DIM)} {_c(quote_line, Colors.ITALIC)}")
+
+    elif block_type == 'hr':
+        lines.append(f"    {_c(connector, Colors.DIM)} {_c('─' * 40, Colors.DIM)}")
+
+    elif block_type == 'error':
+        message = _sanitize(block.get('message', ''))
+        code = block.get('code', '')
+        error_lines = render_admonition('error', code or 'Error', [message])
+        for error_line in error_lines:
+            lines.append(f"    {_c(TREE['pipe'], Colors.DIM)}   {error_line}")
+
+    else:
+        # Unknown block type - fallback (sanitize for security)
+        raw = _sanitize(str(block.get('raw_text', f"[unknown block: {block_type}]")))
+        lines.append(tree_connector_line(is_last=is_last))
+        lines.extend(tree_body_lines(_c(raw, Colors.DIM)))
+
+    return lines
+
+
+def render_response(response: dict) -> str:
+    """Render a structured MCP response."""
+    lines = []
+
+    # Determine source badge (sanitize metadata fields)
+    source = _sanitize(str(response.get('metadata', {}).get('source', 'mcp')))
+    tool = _sanitize(str(response.get('metadata', {}).get('tool', 'unknown')))
+
+    source_colors = {
+        'gemini': Colors.BRIGHT_MAGENTA,
+        'codex': Colors.BRIGHT_GREEN,
+    }
+    badge_color = source_colors.get(source, Colors.BRIGHT_CYAN)
+
+    # Header
+    header = _c(source.upper(), badge_color, Colors.BOLD)
+    tool_label = _c(f"({tool})", Colors.DIM)
+    lines.append(f"{header} {tool_label}")
+    lines.append("")
+
+    # Question (sanitize)
+    question = _sanitize(str(response.get('metadata', {}).get('question', '')))
+    if question:
+        lines.append(f"  {_c('Asked:', Colors.YELLOW)} {_c(question, Colors.CYAN)}")
+        lines.append("")
+
+    # Handle error status
+    if response.get('status') == 'error':
+        error = response.get('error', {})
+        if isinstance(error, dict):
+            error_msg = _sanitize(str(error.get('message', 'Unknown error')))
+            error_code = _sanitize(str(error.get('code', 'ERROR')))
+        else:
+            error_msg = _sanitize(str(error) if error else 'Unknown error')
+            error_code = 'ERROR'
+        error_box = render_admonition('error', error_code, [error_msg])
+        lines.extend(["  " + line for line in error_box])
+        return '\n'.join(lines)
+
+    # Response content
+    lines.append(f"  {_c('Response:', Colors.GREEN)}")
+    lines.append("")
+
+    content = response.get('content', [])
+
+    if not content:
+        # Fallback to raw_text or formatted
+        raw = response.get('raw_text') or response.get('formatted', '')
+        if raw:
+            for line in raw.split('\n'):
+                lines.append(f"    {_sanitize(line)}")
+        return '\n'.join(lines)
+
+    for i, block in enumerate(content):
+        is_last = i == len(content) - 1
+        block_lines = render_block(block, is_last)
+        lines.extend(block_lines)
+
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Render MCP structured responses as ANSI terminal output',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+    mcp-render < response.json
+    mcp-render response.json
+    cat response.json | mcp-render
+    mcp-render --no-color response.json
+    mcp-render --safe response.json
+    mcp-render --mode=responsive response.json
+    MCP_RENDER_MODE=plain mcp-render response.json
+        '''
+    )
+    parser.add_argument('file', nargs='?', help='JSON file to render (reads stdin if not provided)')
+    parser.add_argument('--no-color', action='store_true', help='Disable ANSI colors')
+    parser.add_argument('--safe', action='store_true', help='Enable safe mode (strip ANSI, control chars)')
+    parser.add_argument('--mode', choices=['pretty', 'responsive', 'plain'],
+                        help='Output mode (default: auto-detect based on terminal width)')
+    parser.add_argument('--version', action='version', version='mcp-render 1.1.0')
+
+    args = parser.parse_args()
+
+    global USE_COLOR, SAFE_MODE, RENDER_MODE
+    USE_COLOR = not args.no_color
+    SAFE_MODE = args.safe
+
+    # Set mode from CLI if provided (overrides env var)
+    if args.mode:
+        import os
+        os.environ['MCP_RENDER_MODE'] = args.mode
+
+    # Initialize terminal width (also sets RENDER_MODE from env)
+    init_terminal_width()
+
+    # Read input
+    try:
+        if args.file:
+            with open(args.file, 'r') as f:
+                content = f.read()
+        else:
+            if sys.stdin.isatty():
+                parser.print_help()
+                sys.exit(1)
+            content = sys.stdin.read()
+    except FileNotFoundError:
+        print(f"Error: File not found: {args.file}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading input: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse JSON
+    try:
+        response = json.loads(content)
+    except json.JSONDecodeError:
+        # Not JSON - pass through (sanitize in safe mode)
+        if SAFE_MODE:
+            content = _sanitize(content)
+        print(content)
+        sys.exit(0)
+
+    # Validate it looks like an MCP response
+    if not isinstance(response, dict) or 'version' not in response:
+        # Doesn't look like MCP response - pass through (sanitize in safe mode)
+        if SAFE_MODE:
+            content = _sanitize(content)
+        print(content)
+        sys.exit(0)
+
+    # Render
+    try:
+        output = render_response(response)
+        print(output)
+    except Exception as e:
+        print(f"Error rendering: {e}", file=sys.stderr)
+        # Fallback to raw_text or formatted
+        raw = response.get('raw_text') or response.get('formatted', '')
+        if raw:
+            print(raw)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
