@@ -1,43 +1,36 @@
 # mcpretty
 
-Beautiful terminal rendering for MCP tool responses. Transforms raw JSON from Codex and Gemini MCP servers into ANSI-formatted output with tree structures, box drawing, and syntax highlighting.
-
-## What It Does
+Pretty terminal output for MCP tools. Transforms JSON responses from Codex and Gemini into readable, styled output.
 
 ```
-Raw JSON Response  →  mcpretty  →  Beautiful Terminal Output
-```
-
-Before:
-```json
-{"version":"1.0","metadata":{"source":"codex"},"content":[{"type":"text","text":"Hello"}]}
-```
-
-After:
-```
-├──
-    Hello
+┌─────────────────────────────────────────────────────────┐
+│  Raw JSON  ──►  mcpretty  ──►  Beautiful Terminal Output │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
-- Tree connectors (`├──`, `└──`, `│`) for visual hierarchy
-- Box drawing for tables and callouts
-- ANSI colors for syntax highlighting
-- Automatic width detection and responsive layout
-- Three rendering modes: `pretty`, `responsive`, `plain`
+- **Tree layout** — Visual hierarchy with `├──` `└──` `│` connectors
+- **Box drawing** — Tables and callouts with clean borders
+- **Syntax highlighting** — ANSI colors for code and emphasis
+- **Responsive** — Adapts to terminal width automatically
 
 ## Installation
 
-Copy files to your Claude Code configuration:
+**Requirements:** Python 3.9+, [Claude Code](https://github.com/anthropics/claude-code)
 
 ```bash
+# Clone the repo
+git clone https://github.com/miikeyanderson/mcpretty.git
+cd mcpretty
+
+# Copy to Claude Code config
 cp bin/mcp-render ~/.claude/bin/
 cp hooks/render-mcp-output.py ~/.claude/hooks/
-cp skills/*.md ~/.claude/skills/mcpretty/
+mkdir -p ~/.claude/skills/mcpretty && cp skills/*.md ~/.claude/skills/mcpretty/
 ```
 
-Add the PostToolUse hook to `~/.claude/settings.json`:
+Add the hook to `~/.claude/settings.json`:
 
 ```json
 {
@@ -59,57 +52,31 @@ Add the PostToolUse hook to `~/.claude/settings.json`:
 
 ## Usage
 
-### Automatic (via hook)
+Once installed, MCP responses render automatically. No action needed.
 
-Once installed, MCP responses from Codex/Gemini are automatically rendered.
-
-### Manual
+### Manual usage
 
 ```bash
-# Pipe JSON through renderer
-cat response.json | mcp-render
-
-# Read from file
-mcp-render response.json
-
-# Force plain mode (no ANSI)
-mcp-render --no-color response.json
+cat response.json | ~/.claude/bin/mcp-render
+~/.claude/bin/mcp-render --no-color response.json
 ```
 
-### Environment Variables
+### Render modes
 
-```bash
-export MCP_RENDER_MODE=pretty      # Full styling (default for wide terminals)
-export MCP_RENDER_MODE=responsive  # Compact styling (default for narrow terminals)
-export MCP_RENDER_MODE=plain       # No ANSI codes
-```
+| Mode | Terminal | Output |
+|------|----------|--------|
+| `pretty` | 60+ cols | Full styling |
+| `responsive` | <60 cols | Compact |
+| `plain` | any | No ANSI |
 
-## Schema Requirements
+Set via environment: `export MCP_RENDER_MODE=plain`
 
-Only renders responses matching schema v1.x:
+## How It Works
 
-```json
-{
-  "version": "1.x",
-  "metadata": { ... },
-  "content": [ ... ]
-}
-```
-
-Non-matching responses pass through unchanged.
-
-## Project Structure
+The PostToolUse hook intercepts MCP responses matching schema v1.x and pipes them through the renderer. Non-matching responses pass through unchanged.
 
 ```
-mcpretty/
-├── bin/
-│   └── mcp-render           # Main renderer script
-├── hooks/
-│   └── render-mcp-output.py # PostToolUse hook
-├── skills/
-│   ├── SKILL.md             # Skill definition
-│   └── reference.md         # Technical reference
-└── README.md
+MCP Tool Call → Hook → mcp-render → Styled Output
 ```
 
 ## License
